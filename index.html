@@ -1179,6 +1179,7 @@
                     <span class="cup-number">3</span>
                     <div class="cup-select-circle"></div>
                 </div>
+                <button id="mark-loss-btn" type="button" aria-label="Signaler une prédiction échouée" disabled style="align-self:center; flex:0 0 auto; padding:12px 10px; border:2px solid #ff3333; border-radius:10px; background:#b91c1c; color:white; font-family:'Orbitron',sans-serif; font-size:10px; font-weight:700; cursor:pointer; box-shadow:0 0 14px rgba(255,40,40,.35); opacity:.45;">ÉCHEC ✕</button>
             </div>
             <div style="text-align:center;font-size:11px;color:var(--text-dim);margin-top:8px;">
                 Quand <b>JOUER</b> apparaît → pointe la boîte <b>SANS boule</b> avant la fin du compte à rebours
@@ -1273,7 +1274,9 @@
                 stats: {
                     games: 0,
                     correct: 0,
-                    attempts: 0
+                    attempts: 0,
+                    consecutiveLosses: 0,
+                    pendingRound: null
                 },
                 // WebSocket state
                 ws: null,
@@ -1330,7 +1333,8 @@
                 captureStatus: document.getElementById('capture-status'),
                 capturePreview: document.getElementById('capture-preview'),
                 captureVideo: document.getElementById('capture-video'),
-                captureWarning: document.getElementById('capture-warning')
+                captureWarning: document.getElementById('capture-warning'),
+                markLossBtn: document.getElementById('mark-loss-btn')
             };
 
             // Jouer alert timing variables
@@ -1735,6 +1739,33 @@
                 }).join('');
             }
 
+            // Valide une manche : par défaut succès si l'utilisateur ne signale pas d'échec.
+            function settlePendingRound(isCorrect) {
+                const round = state.stats.pendingRound;
+                if (!round || round.settled) return;
+                round.settled = true;
+                state.stats.games++;
+                if (isCorrect) {
+                    state.stats.correct++;
+                    state.stats.consecutiveLosses = 0;
+                } else {
+                    state.stats.consecutiveLosses++;
+                }
+                addHistory(round.cup, isCorrect, false);
+                updateStats();
+                state.stats.pendingRound = null;
+                el.markLossBtn.disabled = true;
+                el.markLossBtn.style.opacity = '0.45';
+                el.markLossBtn.textContent = isCorrect ? 'VALIDÉ ✓' : 'ÉCHEC ✕';
+                logToConsole(isCorrect ? 'Manche validée automatiquement (aucun échec signalé).' : `Échec signalé. Pertes consécutives : ${state.stats.consecutiveLosses}/2.`, isCorrect ? 'success' : 'error');
+
+                if (state.stats.consecutiveLosses >= 2) {
+                    stopDetection();
+                    el.predictionLabel.textContent = 'Pause de sécurité : 2 échecs consécutifs. Vérifie les résultats avant de reprendre.';
+                    logToConsole('Pause de sécurité activée après 2 échecs consécutifs. Aucune stratégie ne garantit un gain.', 'error');
+                }
+            }
+
             // Generate prediction based on live WebSocket data
             function generateLivePrediction() {
                 const recentResults = state.liveData.lastResults.slice(0, 10);
@@ -1848,6 +1879,9 @@
 
                 // Reset sélection précédente
                 state.emptyBoxSelected = null;
+                el.markLossBtn.disabled = true;
+                el.markLossBtn.style.opacity = '0.45';
+                el.markLossBtn.textContent = 'ÉCHEC ✕';
                 document.querySelectorAll('.cup-item').forEach(item => {
                     item.classList.remove('manual-selected', 'active', 'sensor-red');
                 });
@@ -1896,19 +1930,20 @@
                     showPrediction(prediction);
                     el.predictionLabel.textContent = `Position : Gobelet ${prediction} (boîte ${empty} sans boule)`;
                     state.stats.attempts++;
+                    state.stats.pendingRound = { cup: prediction, settled: false };
+                    el.markLossBtn.disabled = false;
+                    el.markLossBtn.style.opacity = '1';
+                    el.markLossBtn.textContent = 'ÉCHEC ✕';
+                    updateStats();
                     logToConsole(`Prédiction → Gobelet ${prediction} | Boîte vide pointée : ${empty}`, 'success');
 
                     // La position reste 7 secondes
                     setTimeout(() => {
                         if (!state.isRunning) return;
 
-                        // Enregistrement stats (basique)
-                        let actual = state.liveData.lastResults[0] || prediction;
-                        const isCorrect = prediction === actual;
-                        state.stats.games++;
-                        if (isCorrect) state.stats.correct++;
-                        addHistory(prediction, isCorrect, !!state.liveData.lastResults[0]);
-                        updateStats();
+                        // Si aucun clic sur ÉCHEC avant la fin de la manche, elle est validée.
+                        settlePendingRound(true);
+                        if (!state.isRunning) return;
 
                         // Reset
                         el.predictionValue.textContent = '—';
@@ -1968,6 +2003,9 @@
             // Stop detection
             function stopDetection() {
                 state.isRunning = false;
+                state.stats.pendingRound = null;
+                el.markLossBtn.disabled = true;
+                el.markLossBtn.style.opacity = '0.45';
 
                 // Disconnect WebSocket
                 disconnectWebSocket();
@@ -2020,6 +2058,9 @@
                 el.overlay.classList.add('hidden');
             }
 
+            el.markLossBtn.disabled = true;
+            el.markLossBtn.style.opacity = '0.45';
+
             // Event listeners
             el.overlayBtn.addEventListener('click', activateSystem);
             el.overlayInput.addEventListener('keypress', e => {
@@ -2030,11 +2071,22 @@
             el.stopBtn.addEventListener('click', stopDetection);
             el.captureBtn.addEventListener('click', startScreenCapture);
 
+            el.markLossBtn.addEventListener('click', () => {
+                if (!state.stats.pendingRound || state.stats.pendingRound.settled) return;
+                settlePendingRound(false);
+                el.predictionLabel.textContent = state.isRunning
+                    ? 'Échec enregistré manuellement. Attends le prochain tour.'
+                    : 'Pause de sécurité après 2 échecs consécutifs.';
+            });
+
             el.clearHistory.addEventListener('click', () => {
                 state.history = [];
-                state.stats = { games: 0, correct: 0, attempts: 0 };
+                state.stats = { games: 0, correct: 0, attempts: 0, consecutiveLosses: 0, pendingRound: null };
                 state.liveData.lastResults = [];
                 state.emptyBoxSelected = null;
+                el.markLossBtn.disabled = true;
+                el.markLossBtn.style.opacity = '0.45';
+                el.markLossBtn.textContent = 'ÉCHEC ✕';
                 document.querySelectorAll('.cup-item').forEach(item => {
                     item.classList.remove('manual-selected', 'active', 'sensor-red');
                 });
